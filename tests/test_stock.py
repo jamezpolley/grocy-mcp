@@ -59,6 +59,18 @@ async def test_stock_add(mock_client):
         assert "added" in result.lower() or "milk" in result.lower()
 
 
+async def test_stock_add_with_location(mock_client):
+    """Passing a location resolves it and forwards location_id to the client."""
+    with (
+        patch("grocy_mcp.core.stock.resolve_product", return_value=100),
+        patch("grocy_mcp.core.stock.resolve_location", return_value=3) as mock_loc,
+    ):
+        result = await stock_add(mock_client, "Bolognese Mince", 0.5, "Freezer")
+        mock_loc.assert_called_once_with(mock_client, "Freezer")
+        mock_client.add_stock.assert_called_once_with(100, 0.5, location_id=3)
+        assert "Freezer" in result
+
+
 async def test_stock_consume(mock_client):
     with patch("grocy_mcp.core.stock.resolve_product", return_value=1):
         result = await stock_consume(mock_client, "Milk", 1.0)
@@ -89,9 +101,27 @@ async def test_stock_transfer(mock_client):
         patch("grocy_mcp.core.stock.resolve_product", return_value=1),
         patch("grocy_mcp.core.stock.resolve_location", return_value=2),
     ):
-        result = await stock_transfer(mock_client, "Milk", 1.0, "Fridge")
-        mock_client.transfer_stock.assert_called_once_with(1, 1.0, 2)
+        result = await stock_transfer(mock_client, "Milk", 1.0, "Fridge", "Pantry")
+        # to_location resolved first, then from_location; both map to 2 here.
+        mock_client.transfer_stock.assert_called_once_with(1, 1.0, 2, 2)
         assert result
+
+
+async def test_stock_transfer_distinct_locations(mock_client):
+    """Source and destination resolve independently and reach the client in order."""
+    mock_client.transfer_stock.return_value = [{"id": 10}]
+    with (
+        patch("grocy_mcp.core.stock.resolve_product", return_value=100),
+        patch(
+            "grocy_mcp.core.stock.resolve_location",
+            side_effect=lambda _client, name: {"Freezer": 3, "Pantry": 1}[name],
+        ),
+    ):
+        result = await stock_transfer(mock_client, "Bolognese Mince", 0.5, "Freezer", "Pantry")
+        # Signature is transfer_stock(product_id, amount, to_location_id, from_location_id).
+        mock_client.transfer_stock.assert_called_once_with(100, 0.5, 3, 1)
+        assert "Freezer" in result
+        assert "Pantry" in result
 
 
 async def test_stock_inventory(mock_client):
@@ -160,7 +190,7 @@ async def test_stock_transfer_quotes_names(mock_client):
         patch("grocy_mcp.core.stock.resolve_product", return_value=1),
         patch("grocy_mcp.core.stock.resolve_location", return_value=2),
     ):
-        result = await stock_transfer(mock_client, "Eggs", 3.0, "Fridge")
+        result = await stock_transfer(mock_client, "Eggs", 3.0, "Fridge", "Pantry")
         assert "'Eggs'" in result
         assert "'Fridge'" in result
 

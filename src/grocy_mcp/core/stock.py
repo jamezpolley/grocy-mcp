@@ -412,10 +412,24 @@ async def product_family_data(client: GrocyClient, product: str) -> dict:
     }
 
 
-async def stock_add(client: GrocyClient, product: str, amount: float, **kwargs) -> str:
-    """Add stock for a product."""
+async def stock_add(
+    client: GrocyClient,
+    product: str,
+    amount: float,
+    location: str | None = None,
+    **kwargs,
+) -> str:
+    """Add stock for a product, optionally into a specific storage location.
+
+    If *location* is omitted, Grocy books the stock into the product's default
+    storage location.
+    """
     product_id = await resolve_product(client, product)
+    if location is not None:
+        kwargs["location_id"] = await resolve_location(client, location)
     await client.add_stock(product_id, amount, **kwargs)
+    if location is not None:
+        return f"Added {amount} of '{product}' to stock in location '{location}'."
     return f"Added {amount} of '{product}' to stock."
 
 
@@ -426,12 +440,26 @@ async def stock_consume(client: GrocyClient, product: str, amount: float, **kwar
     return f"Consumed {amount} of '{product}' from stock."
 
 
-async def stock_transfer(client: GrocyClient, product: str, amount: float, to_location: str) -> str:
-    """Transfer stock to a different location."""
+async def stock_transfer(
+    client: GrocyClient,
+    product: str,
+    amount: float,
+    to_location: str,
+    from_location: str,
+) -> str:
+    """Transfer stock of a product from one location to another.
+
+    Grocy's transfer endpoint requires both a source and a destination location,
+    so *from_location* is mandatory.
+    """
     product_id = await resolve_product(client, product)
-    location_id = await resolve_location(client, to_location)
-    await client.transfer_stock(product_id, amount, location_id)
-    return f"Transferred {amount} of '{product}' to location '{to_location}'."
+    to_location_id = await resolve_location(client, to_location)
+    from_location_id = await resolve_location(client, from_location)
+    await client.transfer_stock(product_id, amount, to_location_id, from_location_id)
+    return (
+        f"Transferred {amount} of '{product}' from location "
+        f"'{from_location}' to location '{to_location}'."
+    )
 
 
 async def stock_inventory(client: GrocyClient, product: str, new_amount: float) -> str:

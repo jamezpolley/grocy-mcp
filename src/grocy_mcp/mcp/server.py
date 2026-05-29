@@ -197,15 +197,20 @@ def create_mcp_server() -> FastMCP:
             return await stock_product_full_data(client, product)
 
     @mcp.tool()
-    async def stock_add_tool(product: str, amount: float) -> str:
+    async def stock_add_tool(
+        product: str, amount: float, location: str | None = None
+    ) -> str:
         """Add stock for a product (e.g. after a purchase).
 
         Args:
             product: Product name (e.g. "Milk") or numeric product ID.
             amount: Quantity to add (e.g. 2.0 for two units).
+            location: Optional storage location name (e.g. "Freezer") or numeric
+                location ID to book the stock into. If omitted, Grocy uses the
+                product's default location. Use locations_list_tool to see options.
         """
         async with _get_client() as client:
-            return await stock_add(client, product, amount)
+            return await stock_add(client, product, amount, location)
 
     @mcp.tool()
     async def stock_consume_tool(product: str, amount: float) -> str:
@@ -219,16 +224,22 @@ def create_mcp_server() -> FastMCP:
             return await stock_consume(client, product, amount)
 
     @mcp.tool()
-    async def stock_transfer_tool(product: str, amount: float, to_location: str) -> str:
-        """Move stock of a product to a different storage location.
+    async def stock_transfer_tool(
+        product: str, amount: float, to_location: str, from_location: str
+    ) -> str:
+        """Move stock of a product between two storage locations.
+
+        Grocy requires an explicit source location, so both ends are mandatory.
 
         Args:
             product: Product name (e.g. "Milk") or numeric product ID.
             amount: Quantity to transfer.
-            to_location: Destination location name (e.g. "Fridge") or numeric location ID.
+            to_location: Destination location name (e.g. "Freezer") or numeric location ID.
+            from_location: Source location name (e.g. "Pantry") or numeric location ID.
+                Use locations_list_tool to see options.
         """
         async with _get_client() as client:
-            return await stock_transfer(client, product, amount, to_location)
+            return await stock_transfer(client, product, amount, to_location, from_location)
 
     @mcp.tool()
     async def stock_inventory_tool(product: str, new_amount: float) -> str:

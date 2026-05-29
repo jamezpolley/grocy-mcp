@@ -80,6 +80,28 @@ async def test_add_stock(client, mock_api):
     assert result is not None
 
 
+async def test_add_stock_with_location_id(client, mock_api):
+    import json as _json
+
+    route = mock_api.post("/stock/products/100/add").mock(
+        return_value=httpx.Response(200, json=[{"id": 11}])
+    )
+    await client.add_stock(100, 0.5, location_id=3)
+    body = _json.loads(route.calls[0].request.content)
+    assert body == {"amount": 0.5, "location_id": 3}
+
+
+async def test_transfer_stock_sends_both_locations(client, mock_api):
+    import json as _json
+
+    route = mock_api.post("/stock/products/100/transfer").mock(
+        return_value=httpx.Response(200, json=[{"id": 12}])
+    )
+    await client.transfer_stock(100, 0.5, to_location_id=3, from_location_id=1)
+    body = _json.loads(route.calls[0].request.content)
+    assert body == {"amount": 0.5, "location_id_from": 1, "location_id_to": 3}
+
+
 async def test_consume_stock(client, mock_api):
     mock_api.post("/stock/products/1/consume").mock(
         return_value=httpx.Response(200, json=[{"id": 10}])

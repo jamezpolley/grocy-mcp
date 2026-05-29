@@ -388,12 +388,15 @@ def cmd_stock_product_info(product: str = typer.Argument(..., help="Product name
 def cmd_stock_add(
     product: str = typer.Argument(..., help="Product name or ID."),
     amount: float = typer.Argument(..., help="Quantity to add."),
+    location: str | None = typer.Option(
+        None, "--location", "-l", help="Storage location name or ID to book into."
+    ),
 ) -> None:
     """Add stock for a product."""
 
     async def _inner():
         async with _client() as client:
-            return await stock_add(client, product, amount)
+            return await stock_add(client, product, amount, location)
 
     _exec(_inner())
 
@@ -417,12 +420,13 @@ def cmd_stock_transfer(
     product: str = typer.Argument(..., help="Product name or ID."),
     amount: float = typer.Argument(..., help="Quantity to transfer."),
     to_location: str = typer.Argument(..., help="Destination location name or ID."),
+    from_location: str = typer.Argument(..., help="Source location name or ID."),
 ) -> None:
-    """Transfer stock to a different location."""
+    """Transfer stock from one location to another."""
 
     async def _inner():
         async with _client() as client:
-            return await stock_transfer(client, product, amount, to_location)
+            return await stock_transfer(client, product, amount, to_location, from_location)
 
     _exec(_inner())
 
