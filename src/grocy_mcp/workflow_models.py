@@ -69,6 +69,10 @@ class WorkflowApplyItem(BaseModel):
     product_id: int
     amount: float
     note: str | None = None
+    price: float | None = None
+    best_before_date: str | None = None
+    shopping_location_id: int | None = None
+    purchased_date: str | None = None
 
     model_config = {"extra": "forbid"}
 
@@ -82,6 +86,11 @@ class WorkflowApplyItem(BaseModel):
     @field_validator("note")
     @classmethod
     def normalize_note(cls, value: str | None) -> str | None:
+        return _normalize_optional_text(value)
+
+    @field_validator("best_before_date", "purchased_date")
+    @classmethod
+    def normalize_date(cls, value: str | None) -> str | None:
         return _normalize_optional_text(value)
 
 

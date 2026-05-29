@@ -94,7 +94,7 @@ async def test_workflow_stock_intake_apply_data():
         [{"product_id": 12, "amount": 2, "note": "organic"}],
     )
 
-    client.add_stock.assert_awaited_once_with(12, 2)
+    client.add_stock.assert_awaited_once_with(12, 2.0, note="organic")
     assert result["applied_count"] == 1
     assert result["applied_items"][0]["note"] == "organic"
 

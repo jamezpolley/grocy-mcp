@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 from grocy_mcp.client import GrocyClient
 from grocy_mcp.core.resolve import resolve_location, resolve_product
 
@@ -67,6 +69,213 @@ async def stock_product_info(client: GrocyClient, product: str) -> str:
     best_before = info.get("next_best_before_date", "unknown")
 
     return f"Product: {name}\n  In stock: {amount}\n  Next best before: {best_before}"
+
+
+def _resolve_qu(info: dict, role: str) -> dict | None:
+    """Extract a resolved QU object by role from a stock product response.
+
+    Roles: 'stock' → quantity_unit_stock, 'purchase' → default_quantity_unit_purchase,
+           'consume' → default_quantity_unit_consume, 'price' → quantity_unit_price.
+    """
+    key_map = {
+        "stock": "quantity_unit_stock",
+        "purchase": "default_quantity_unit_purchase",
+        "consume": "default_quantity_unit_consume",
+        "price": "quantity_unit_price",
+    }
+    key = key_map.get(role)
+    if not key:
+        return None
+    qu = info.get(key)
+    if not qu:
+        return None
+    return {"id": qu.get("id"), "name": qu.get("name"), "name_plural": qu.get("name_plural")}
+
+
+async def stock_product_full_data(client: GrocyClient, product: str) -> dict:
+    """Return a comprehensive dict for a single product in one call.
+
+    Aggregates product fields, resolved names for all FK references, current stock
+    totals, all product-specific quantity-unit conversions, and all product barcodes
+    (with resolved QU and shopping-location names).
+
+    Stock journal / history entries are intentionally excluded — use
+    ``stock_journal_tool`` when history is needed.
+
+    Response shape::
+
+        {
+          "product": {<full product object from /objects/products>},
+          "stock": {
+            "amount": float,
+            "amount_opened": float,
+            "amount_aggregated": float,
+            "amount_opened_aggregated": float,
+            "value": float,
+            "last_purchased": str | None,
+            "last_used": str | None,
+            "last_price": float | None,
+            "avg_price": float | None,
+            "next_due_date": str | None,
+          },
+          "units": {
+            "stock":    {"id": int, "name": str, "name_plural": str} | None,
+            "purchase": {"id": int, "name": str, "name_plural": str} | None,
+            "consume":  {"id": int, "name": str, "name_plural": str} | None,
+            "price":    {"id": int, "name": str, "name_plural": str} | None,
+          },
+          "location": {"id": int, "name": str} | None,
+          "shopping_location": {"id": int, "name": str} | None,
+          "product_group": {"id": int, "name": str} | None,
+          "parent_product": {"id": int, "name": str} | None,
+          "barcodes": [
+            {
+              "id": int, "barcode": str, "amount": float | None,
+              "last_price": float | None, "note": str | None,
+              "qu": {"id": int, "name": str} | None,
+              "shopping_location": {"id": int, "name": str} | None,
+            }, ...
+          ],
+          "conversions": [
+            {
+              "id": int, "factor": float,
+              "from_qu": {"id": int, "name": str},
+              "to_qu":   {"id": int, "name": str},
+            }, ...
+          ],
+        }
+
+    Args:
+        product: Product name (e.g. "Milk") or numeric product ID.
+    """
+    product_id = await resolve_product(client, product)
+
+    # Fetch stock details and product-specific QU conversions in parallel.
+    # Barcodes are already embedded in the stock/products/{id} response.
+    info, conversions_raw = await asyncio.gather(
+        client.get_stock_product(product_id),
+        client.get_objects("quantity_unit_conversions", query=f"product_id={product_id}"),
+    )
+
+    product_data = info.get("product") or {}
+
+    # ── Stock totals ──────────────────────────────────────────────────────────
+    stock = {
+        "amount": info.get("stock_amount"),
+        "amount_opened": info.get("stock_amount_opened"),
+        "amount_aggregated": info.get("stock_amount_aggregated"),
+        "amount_opened_aggregated": info.get("stock_amount_opened_aggregated"),
+        "value": info.get("stock_value"),
+        "last_purchased": info.get("last_purchased"),
+        "last_used": info.get("last_used"),
+        "last_price": info.get("last_price"),
+        "avg_price": info.get("avg_price"),
+        "next_due_date": info.get("next_due_date"),
+    }
+
+    # ── Resolved QU roles ─────────────────────────────────────────────────────
+    units = {
+        "stock": _resolve_qu(info, "stock"),
+        "purchase": _resolve_qu(info, "purchase"),
+        "consume": _resolve_qu(info, "consume"),
+        "price": _resolve_qu(info, "price"),
+    }
+
+    # ── Location ──────────────────────────────────────────────────────────────
+    loc_raw = info.get("location")
+    location = {"id": loc_raw["id"], "name": loc_raw["name"]} if loc_raw else None
+
+    # ── Shopping location (product default) ───────────────────────────────────
+    # The stock response embeds the last-used shopping location id but not the
+    # product-default one.  Resolve the product's shopping_location_id if set.
+    shopping_location: dict | None = None
+    sl_id = product_data.get("shopping_location_id")
+    if sl_id:
+        try:
+            sl_raw = await client.get_object("shopping_locations", sl_id)
+            shopping_location = {"id": sl_raw["id"], "name": sl_raw["name"]}
+        except Exception:
+            shopping_location = {"id": sl_id, "name": None}
+
+    # ── Product group ─────────────────────────────────────────────────────────
+    product_group: dict | None = None
+    pg_id = product_data.get("product_group_id")
+    if pg_id:
+        try:
+            pg_raw = await client.get_object("product_groups", pg_id)
+            product_group = {"id": pg_raw["id"], "name": pg_raw["name"]}
+        except Exception:
+            product_group = {"id": pg_id, "name": None}
+
+    # ── Parent product ────────────────────────────────────────────────────────
+    parent_product: dict | None = None
+    pp_id = product_data.get("parent_product_id")
+    if pp_id:
+        try:
+            pp_raw = await client.get_object("products", pp_id)
+            parent_product = {"id": pp_raw["id"], "name": pp_raw["name"]}
+        except Exception:
+            parent_product = {"id": pp_id, "name": None}
+
+    # ── Barcodes (already embedded in the stock response) ────────────────────
+    # Build a QU id→name lookup from the four embedded QU objects to avoid
+    # extra round-trips when resolving barcode QU names.
+    qu_lookup: dict[int, str] = {}
+    for role_key in ("quantity_unit_stock", "default_quantity_unit_purchase",
+                     "default_quantity_unit_consume", "quantity_unit_price"):
+        qu_obj = info.get(role_key) or {}
+        if qu_obj.get("id"):
+            qu_lookup[qu_obj["id"]] = qu_obj.get("name", "")
+
+    barcodes = []
+    for bc in info.get("product_barcodes") or []:
+        qu_id = bc.get("qu_id")
+        bc_qu = {"id": qu_id, "name": qu_lookup.get(qu_id)} if qu_id else None
+        sl_bc_id = bc.get("shopping_location_id")
+        bc_sl: dict | None = None
+        if sl_bc_id:
+            # Reuse the product-default shopping location dict if the id matches
+            if shopping_location and shopping_location["id"] == sl_bc_id:
+                bc_sl = shopping_location
+            else:
+                try:
+                    sl_bc_raw = await client.get_object("shopping_locations", sl_bc_id)
+                    bc_sl = {"id": sl_bc_raw["id"], "name": sl_bc_raw["name"]}
+                except Exception:
+                    bc_sl = {"id": sl_bc_id, "name": None}
+        barcodes.append({
+            "id": bc.get("id"),
+            "barcode": bc.get("barcode"),
+            "amount": bc.get("amount"),
+            "last_price": bc.get("last_price"),
+            "note": bc.get("note"),
+            "qu": bc_qu,
+            "shopping_location": bc_sl,
+        })
+
+    # ── QU conversions (product-specific only) ────────────────────────────────
+    conversions = []
+    for cv in conversions_raw:
+        from_id = cv.get("from_qu_id")
+        to_id = cv.get("to_qu_id")
+        conversions.append({
+            "id": cv.get("id"),
+            "factor": cv.get("factor"),
+            "from_qu": {"id": from_id, "name": qu_lookup.get(from_id)},
+            "to_qu": {"id": to_id, "name": qu_lookup.get(to_id)},
+        })
+
+    return {
+        "product": product_data,
+        "stock": stock,
+        "units": units,
+        "location": location,
+        "shopping_location": shopping_location,
+        "product_group": product_group,
+        "parent_product": parent_product,
+        "barcodes": barcodes,
+        "conversions": conversions,
+    }
 
 
 async def stock_add(client: GrocyClient, product: str, amount: float, **kwargs) -> str:

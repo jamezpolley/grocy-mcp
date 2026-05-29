@@ -214,7 +214,12 @@ async def workflow_stock_intake_apply_data(client: GrocyClient, items: list[dict
     parsed_items = _parse_model_list(items, WorkflowApplyItem, "items")
 
     for item in parsed_items:
-        await client.add_stock(item.product_id, item.amount)
+        extra = {
+            k: v
+            for k, v in item.model_dump(exclude={"product_id", "amount"}).items()
+            if v is not None
+        }
+        await client.add_stock(item.product_id, item.amount, **extra)
 
     return {
         "applied_count": len(parsed_items),
