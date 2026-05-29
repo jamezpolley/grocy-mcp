@@ -278,6 +278,140 @@ async def stock_product_full_data(client: GrocyClient, product: str) -> dict:
     }
 
 
+def _is_parent_flag(value) -> bool:
+    """Coerce Grocy's 0/1/"0"/"1"/bool flag fields to a real bool."""
+    return value in (1, "1", True)
+
+
+async def product_family_data(client: GrocyClient, product: str) -> dict:
+    """Resolve a product's parent/child family and aggregated stock in one call.
+
+    Grocy models product variants with ``parent_product_id``: a "parent" product
+    (e.g. "Laundry liquid") groups its concrete child products (e.g. "Omo Speed
+    Clean 1.18L"). Parents often carry ``no_own_stock=1`` and
+    ``cumulate_min_stock_amount_of_sub_products=1`` — their real stock lives in the
+    children and surfaces on the parent as ``amount_aggregated``.
+
+    This helper works from either end: given a parent OR a child (by name or id),
+    it resolves up to the family root (the parent, or the product itself if it has
+    no parent) and returns the root plus every child, each with its current stock
+    amount and unit, alongside the root's aggregated totals.
+
+    Response shape::
+
+        {
+          "root": {
+            "id": int,
+            "name": str,
+            "is_parent": bool,                 # has children OR no_own_stock set
+            "no_own_stock": bool,
+            "cumulate_min_stock_amount_of_sub_products": bool,
+            "min_stock_amount": float,
+            "stock_unit": {"id": int, "name": str, "name_plural": str} | None,
+            "amount": float,                   # root's own stock (often 0 for parents)
+            "amount_opened": float,
+            "amount_aggregated": float,        # root + all children
+            "amount_opened_aggregated": float,
+          },
+          "queried": {"id": int, "name": str, "was_child": bool},
+          "children": [
+            {
+              "id": int,
+              "name": str,
+              "amount": float,                 # current stock for this child
+              "unit": {"id": int, "name": str, "name_plural": str} | None,
+              "min_stock_amount": float,
+            }, ...
+          ],
+        }
+
+    Args:
+        product: Product name (e.g. "Laundry liquid" or "Omo Speed Clean 1.18L")
+            or numeric product ID. May be a parent or a child.
+    """
+    queried_id = await resolve_product(client, product)
+
+    # Pull the queried product's full object (gives parent_product_id + flags),
+    # the global stock snapshot (amount per in-stock product_id), and the unit
+    # table (to name child units without N extra round-trips), in parallel.
+    queried_info, stock_items, units_raw = await asyncio.gather(
+        client.get_stock_product(queried_id),
+        client.get_stock(),
+        client.get_objects("quantity_units"),
+    )
+    queried_product = queried_info.get("product") or {}
+    queried_name = queried_product.get("name", f"Product {queried_id}")
+
+    # Build amount lookups from the stock snapshot (products with zero stock are
+    # absent from /stock, so default to 0).
+    amount_by_pid: dict[int, float] = {}
+    opened_by_pid: dict[int, float] = {}
+    for item in stock_items:
+        pid = item.get("product_id")
+        if pid is None:
+            continue
+        amount_by_pid[pid] = item.get("amount", 0) or 0
+        opened_by_pid[pid] = item.get("amount_opened", 0) or 0
+
+    # Unit id → unit dict lookup.
+    unit_by_id: dict[int, dict] = {
+        u["id"]: {"id": u["id"], "name": u.get("name"), "name_plural": u.get("name_plural")}
+        for u in units_raw
+        if u.get("id") is not None
+    }
+
+    # Resolve the family root: the parent if this is a child, else self.
+    parent_id = queried_product.get("parent_product_id")
+    was_child = bool(parent_id)
+    if was_child:
+        root_info = await client.get_stock_product(int(parent_id))
+        root_product = root_info.get("product") or {}
+    else:
+        root_info = queried_info
+        root_product = queried_product
+    root_id = root_product.get("id", queried_id)
+
+    # Children: every product whose parent_product_id == root_id.
+    children_raw = await client.get_objects(
+        "products", query=f"parent_product_id={root_id}"
+    )
+
+    children = []
+    for c in children_raw:
+        cid = c.get("id")
+        qu_id = c.get("qu_id_stock")
+        children.append({
+            "id": cid,
+            "name": c.get("name"),
+            "amount": amount_by_pid.get(cid, 0),
+            "unit": unit_by_id.get(qu_id) if qu_id else None,
+            "min_stock_amount": c.get("min_stock_amount", 0),
+        })
+
+    root_qu_id = root_product.get("qu_id_stock")
+    root = {
+        "id": root_id,
+        "name": root_product.get("name", f"Product {root_id}"),
+        "is_parent": bool(children) or _is_parent_flag(root_product.get("no_own_stock")),
+        "no_own_stock": _is_parent_flag(root_product.get("no_own_stock")),
+        "cumulate_min_stock_amount_of_sub_products": _is_parent_flag(
+            root_product.get("cumulate_min_stock_amount_of_sub_products")
+        ),
+        "min_stock_amount": root_product.get("min_stock_amount", 0),
+        "stock_unit": unit_by_id.get(root_qu_id) if root_qu_id else None,
+        "amount": root_info.get("stock_amount"),
+        "amount_opened": root_info.get("stock_amount_opened"),
+        "amount_aggregated": root_info.get("stock_amount_aggregated"),
+        "amount_opened_aggregated": root_info.get("stock_amount_opened_aggregated"),
+    }
+
+    return {
+        "root": root,
+        "queried": {"id": queried_id, "name": queried_name, "was_child": was_child},
+        "children": children,
+    }
+
+
 async def stock_add(client: GrocyClient, product: str, amount: float, **kwargs) -> str:
     """Add stock for a product."""
     product_id = await resolve_product(client, product)

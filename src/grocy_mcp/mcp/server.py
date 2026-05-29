@@ -72,6 +72,7 @@ from grocy_mcp.core.shopping import (
     shopping_list_view,
 )
 from grocy_mcp.core.stock import (
+    product_family_data,
     stock_add,
     stock_barcode_lookup,
     stock_consume,
@@ -256,17 +257,61 @@ def create_mcp_server() -> FastMCP:
 
     @mcp.tool()
     async def stock_search_tool(query: str) -> str:
-        """Search for products by name substring or barcode.
+        """Find products whose NAME or BARCODE contains a substring.
 
-        Returns matching product names and IDs. Use this when you are not sure
-        of the exact product name. For a direct barcode lookup with stock details,
-        use stock_barcode_lookup_tool instead.
+        This is a plain case-insensitive SUBSTRING match on the product name and
+        barcode fields ONLY. It does NOT understand categories, variants, or
+        parent/child relationships, so it will MISS related products that don't
+        literally contain the query text. Do not conclude "there's only one" from
+        a name search — a single hit may be a parent with differently-named
+        children, or a category whose members use brand names.
+
+        Escalate to a relationship- or category-aware tool when the question is
+        "show me all X" rather than "find the product literally called X":
+        - Variants / children of a product → product_family_tool (one call returns
+          the product, its children, and aggregated stock), or
+          entity_query_tool(entity="products", filters={"parent_product_id": <id>}).
+        - Everything in a category → entity_query_tool(entity="products",
+          filters={"product_group_id": <id>}) (find the group id via
+          entity_list_tool(entity="product_groups")).
+        For a direct barcode lookup with stock details, use stock_barcode_lookup_tool.
 
         Args:
-            query: Search string to match against product names and barcodes.
+            query: Substring to match against product names and barcodes.
         """
         async with _get_client() as client:
             return await stock_search(client, query)
+
+    @mcp.tool()
+    async def product_family_tool(product: str) -> dict:
+        """Get a product's full parent/child family + aggregated stock in one call.
+
+        Grocy models product variants with ``parent_product_id``: a parent product
+        (e.g. "Laundry liquid") groups concrete children (e.g. "Omo Speed Clean
+        1.18L", "Omo Odor Refresh 1.94L"). Parents commonly have ``no_own_stock=1``
+        and ``cumulate_min_stock_amount_of_sub_products=1`` — their real stock lives
+        in the children and shows on the parent as ``amount_aggregated``.
+
+        Use this for "show me all <category/variant>" questions where a plain name
+        search (stock_search_tool) would only return one product. It works from
+        EITHER end: pass a parent or a child (by name or id) and it resolves up to
+        the family root and returns the whole family.
+
+        Returns a structured dict:
+        - ``root``: the family root — id, name, ``is_parent``, ``no_own_stock``,
+          ``cumulate_min_stock_amount_of_sub_products``, ``min_stock_amount``,
+          ``stock_unit``, and stock totals (``amount``, ``amount_opened``,
+          ``amount_aggregated``, ``amount_opened_aggregated``).
+        - ``queried``: the product you passed (id, name, ``was_child``).
+        - ``children``: each child product with ``amount`` (current stock),
+          ``unit``, and ``min_stock_amount``.
+
+        Args:
+            product: Product name (e.g. "Laundry liquid") or numeric product ID;
+                may be a parent or a child.
+        """
+        async with _get_client() as client:
+            return await product_family_data(client, product)
 
     @mcp.tool()
     async def stock_barcode_lookup_tool(barcode: str) -> str:

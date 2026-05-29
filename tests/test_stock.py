@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from grocy_mcp.core.stock import (
+    product_family_data,
     stock_add,
     stock_barcode_lookup,
     stock_consume,
@@ -339,3 +340,159 @@ async def test_stock_product_full_data_no_group_no_parent(full_mock_client):
     calls = [str(c) for c in full_mock_client.get_object.call_args_list]
     assert not any("product_groups" in c for c in calls)
     assert not any("products" in c for c in calls)
+
+
+# ── product_family_data tests ───────────────────────────────────────────────────
+
+# Parent "Laundry liquid" (id 125): no own stock, cumulates children's min stock.
+_PARENT_125_STOCK = {
+    "product": {
+        "id": 125,
+        "name": "Laundry liquid",
+        "parent_product_id": None,
+        "no_own_stock": 1,
+        "cumulate_min_stock_amount_of_sub_products": 1,
+        "min_stock_amount": 0,
+        "qu_id_stock": 8,
+    },
+    "stock_amount": 0,
+    "stock_amount_opened": 0,
+    "stock_amount_aggregated": 3.12,
+    "stock_amount_opened_aggregated": 1.18,
+}
+
+# Child "Omo Speed Clean 1.18L" (id 126).
+_CHILD_126_STOCK = {
+    "product": {
+        "id": 126,
+        "name": "Omo Speed Clean 1.18L",
+        "parent_product_id": 125,
+        "no_own_stock": 0,
+        "cumulate_min_stock_amount_of_sub_products": 0,
+        "min_stock_amount": 1,
+        "qu_id_stock": 8,
+    },
+    "stock_amount": 1.18,
+    "stock_amount_opened": 1.18,
+    "stock_amount_aggregated": 1.18,
+    "stock_amount_opened_aggregated": 1.18,
+}
+
+_FAMILY_CHILDREN = [
+    {"id": 126, "name": "Omo Speed Clean 1.18L", "parent_product_id": 125,
+     "qu_id_stock": 8, "min_stock_amount": 1},
+    {"id": 127, "name": "Omo Odor Refresh 1.94L", "parent_product_id": 125,
+     "qu_id_stock": 8, "min_stock_amount": 1},
+]
+
+_FAMILY_STOCK_SNAPSHOT = [
+    {"product_id": 126, "amount": 1.18, "amount_opened": 1.18},
+    {"product_id": 127, "amount": 1.94, "amount_opened": 0},
+]
+
+_QUANTITY_UNITS = [{"id": 8, "name": "litre", "name_plural": "litres"}]
+
+
+def _family_client(start_info):
+    """Build a mock client for product_family_data starting from start_info."""
+    client = AsyncMock()
+    # First get_stock_product call is for the queried product; a later call (when
+    # starting from a child) fetches the parent.
+    client.get_stock_product.side_effect = lambda pid: {
+        125: _PARENT_125_STOCK,
+        126: _CHILD_126_STOCK,
+    }[pid]
+    client.get_stock.return_value = _FAMILY_STOCK_SNAPSHOT
+
+    async def get_objects(entity, query=None):
+        if entity == "quantity_units":
+            return _QUANTITY_UNITS
+        if entity == "products" and query == "parent_product_id=125":
+            return _FAMILY_CHILDREN
+        return []
+
+    client.get_objects.side_effect = get_objects
+    return client
+
+
+async def test_product_family_from_parent():
+    """Querying the parent returns root + all children with per-child amounts."""
+    client = _family_client(_PARENT_125_STOCK)
+    with patch("grocy_mcp.core.stock.resolve_product", return_value=125):
+        result = await product_family_data(client, "Laundry liquid")
+
+    assert result["root"]["id"] == 125
+    assert result["root"]["is_parent"] is True
+    assert result["root"]["no_own_stock"] is True
+    assert result["root"]["cumulate_min_stock_amount_of_sub_products"] is True
+    assert result["root"]["amount_aggregated"] == 3.12
+    assert result["root"]["stock_unit"] == {"id": 8, "name": "litre", "name_plural": "litres"}
+
+    assert result["queried"] == {"id": 125, "name": "Laundry liquid", "was_child": False}
+
+    assert len(result["children"]) == 2
+    by_id = {c["id"]: c for c in result["children"]}
+    assert by_id[126]["name"] == "Omo Speed Clean 1.18L"
+    assert by_id[126]["amount"] == 1.18
+    assert by_id[126]["unit"] == {"id": 8, "name": "litre", "name_plural": "litres"}
+    assert by_id[127]["amount"] == 1.94
+
+
+async def test_product_family_from_child_resolves_to_parent():
+    """Querying a child resolves up to the parent and returns the whole family."""
+    client = _family_client(_CHILD_126_STOCK)
+    with patch("grocy_mcp.core.stock.resolve_product", return_value=126):
+        result = await product_family_data(client, "Omo Speed Clean 1.18L")
+
+    # Root resolved to the parent, not the child.
+    assert result["root"]["id"] == 125
+    assert result["root"]["name"] == "Laundry liquid"
+    assert result["queried"] == {
+        "id": 126, "name": "Omo Speed Clean 1.18L", "was_child": True
+    }
+    # Family still includes both children.
+    assert {c["id"] for c in result["children"]} == {126, 127}
+
+
+async def test_product_family_child_with_zero_stock_defaults_zero():
+    """A child absent from the /stock snapshot reports amount 0, not an error."""
+    client = _family_client(_PARENT_125_STOCK)
+    client.get_stock.return_value = [
+        {"product_id": 126, "amount": 1.18, "amount_opened": 1.18},
+    ]  # 127 missing → out of stock
+    with patch("grocy_mcp.core.stock.resolve_product", return_value=125):
+        result = await product_family_data(client, "125")
+
+    by_id = {c["id"]: c for c in result["children"]}
+    assert by_id[127]["amount"] == 0
+
+
+async def test_product_family_standalone_product_no_children():
+    """A product with no parent and no children returns itself as root, empty children."""
+    standalone = {
+        "product": {
+            "id": 50, "name": "Salt", "parent_product_id": None,
+            "no_own_stock": 0, "cumulate_min_stock_amount_of_sub_products": 0,
+            "min_stock_amount": 0, "qu_id_stock": 8,
+        },
+        "stock_amount": 2, "stock_amount_opened": 0,
+        "stock_amount_aggregated": 2, "stock_amount_opened_aggregated": 0,
+    }
+    client = AsyncMock()
+    client.get_stock_product.return_value = standalone
+    client.get_stock.return_value = [{"product_id": 50, "amount": 2, "amount_opened": 0}]
+
+    async def get_objects(entity, query=None):
+        if entity == "quantity_units":
+            return _QUANTITY_UNITS
+        return []  # no children
+
+    client.get_objects.side_effect = get_objects
+
+    with patch("grocy_mcp.core.stock.resolve_product", return_value=50):
+        result = await product_family_data(client, "Salt")
+
+    assert result["root"]["id"] == 50
+    assert result["root"]["is_parent"] is False
+    assert result["children"] == []
+    assert result["queried"]["was_child"] is False

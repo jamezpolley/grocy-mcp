@@ -186,3 +186,60 @@ async def test_file_download_tool_returns_base64(monkeypatch):
     payload = result.structured_content.get("result", result.structured_content)
     assert payload["group"] == "productpictures"
     assert payload["content_type"] == "text/plain"
+
+
+async def test_product_family_tool_returns_structured_data(monkeypatch):
+    mcp = create_mcp_server()
+
+    @asynccontextmanager
+    async def fake_client():
+        class Client:
+            async def get_stock_product(self, product_id: int):
+                return {
+                    "product": {
+                        "id": 125,
+                        "name": "Laundry liquid",
+                        "parent_product_id": None,
+                        "no_own_stock": 1,
+                        "cumulate_min_stock_amount_of_sub_products": 1,
+                        "min_stock_amount": 0,
+                        "qu_id_stock": 8,
+                    },
+                    "stock_amount": 0,
+                    "stock_amount_opened": 0,
+                    "stock_amount_aggregated": 3.12,
+                    "stock_amount_opened_aggregated": 1.18,
+                }
+
+            async def get_stock(self):
+                return [{"product_id": 126, "amount": 1.18, "amount_opened": 1.18}]
+
+            async def get_objects(self, entity: str, query: str | None = None):
+                if entity == "quantity_units":
+                    return [{"id": 8, "name": "litre", "name_plural": "litres"}]
+                if entity == "products" and query == "parent_product_id=125":
+                    return [
+                        {"id": 126, "name": "Omo Speed Clean 1.18L",
+                         "parent_product_id": 125, "qu_id_stock": 8, "min_stock_amount": 1},
+                    ]
+                return []
+
+        yield Client()
+
+    monkeypatch.setattr("grocy_mcp.mcp.server._get_client", fake_client)
+    monkeypatch.setattr(
+        "grocy_mcp.core.stock.resolve_product",
+        lambda client, product: _async_return(125),
+    )
+
+    result = await mcp.call_tool("product_family_tool", {"product": "Laundry liquid"})
+
+    family = result.structured_content.get("result", result.structured_content)
+    assert family["root"]["id"] == 125
+    assert family["root"]["is_parent"] is True
+    assert family["children"][0]["name"] == "Omo Speed Clean 1.18L"
+    assert family["children"][0]["amount"] == 1.18
+
+
+async def _async_return(value):
+    return value
