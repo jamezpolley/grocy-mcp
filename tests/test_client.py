@@ -26,6 +26,25 @@ async def test_get_objects(client, mock_api):
     assert result == [{"id": 1, "name": "Milk"}]
 
 
+async def test_get_objects_single_query(client, mock_api):
+    route = mock_api.get("/objects/products").mock(
+        return_value=httpx.Response(200, json=[{"id": 1, "name": "Milk"}])
+    )
+    result = await client.get_objects("products", query="shopping_location_id=1")
+    assert result == [{"id": 1, "name": "Milk"}]
+    assert route.calls[0].request.url.params.get("query[]") == "shopping_location_id=1"
+
+
+async def test_get_objects_list_query_serializes_repeated_params(client, mock_api):
+    route = mock_api.get("/objects/products").mock(
+        return_value=httpx.Response(200, json=[])
+    )
+    await client.get_objects("products", query=["shopping_location_id=1", "active=1"])
+    # respx exposes parsed params; multiple query[] values come back as a list.
+    params = route.calls[0].request.url.params
+    assert params.get_list("query[]") == ["shopping_location_id=1", "active=1"]
+
+
 async def test_get_object(client, mock_api):
     mock_api.get("/objects/products/1").mock(
         return_value=httpx.Response(200, json={"id": 1, "name": "Milk"})

@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Read/query tools**: `entity_get` returns the full field set of a single entity object by id (every column, not just id+name); `entity_query` runs server-side equality filters (`query[]=field=value`, ANDed) and returns structured rows with optional field projection for programmatic counting/filtering
+- **Client query filters**: `GrocyClient.get_objects` now accepts a list of `field=value` clauses (serialized as repeated `query[]` params) in addition to a single string
 - **Testbed layer**: in-repo `testbed/` package for deterministic and provider-backed end-to-end Grocy workflow validation
 - **Demo environment tooling**: disposable Grocy Compose stack, seed profile, reset/bootstrap scripts, and local auth shim for CLI/MCP validation
 - **Scenario assets**: frozen receipt, pantry, and recipe fixtures with golden normalized JSON, confirmation files, and expected outcome assertions

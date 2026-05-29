@@ -76,7 +76,16 @@ class GrocyClient:
 
     # --- Generic CRUD ---
 
-    async def get_objects(self, entity: str, query: str | None = None) -> list[dict]:
+    async def get_objects(
+        self, entity: str, query: str | list[str] | None = None
+    ) -> list[dict]:
+        """List objects of an entity, optionally filtered server-side.
+
+        ``query`` maps to Grocy's ``query[]=field=value`` query parameters. Pass a
+        single ``"field=value"`` string for one filter, or a list of such strings to
+        AND multiple filters together (httpx serializes the list as repeated
+        ``query[]`` params).
+        """
         params = {"query[]": query} if query else None
         resp = await self._request("GET", f"/objects/{entity}", params=params)
         return resp.json()

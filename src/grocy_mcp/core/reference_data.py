@@ -352,6 +352,83 @@ async def search_entity_candidates(
     return "\n".join(lines)
 
 
+async def entity_get_data(client: GrocyClient, entity: str, obj_id: int) -> dict:
+    """Fetch the complete field set of a single entity object by id.
+
+    Unlike the summarized list/details views, this returns the raw object exactly
+    as Grocy's ``GET /objects/{entity}/{id}`` endpoint serves it — every column,
+    including fields the formatted views drop (e.g. ``min_stock_amount``,
+    ``default_consume_location_id``, ``description``, ``picture_file_name``,
+    ``shopping_location_id``, timestamps, and userfields).
+
+    Args:
+        entity: Entity type name (must be an exposed Grocy entity).
+        obj_id: The numeric object id.
+
+    Returns:
+        The full object dict for the requested id.
+    """
+    if entity not in EXPOSED_ENTITIES:
+        raise GrocyValidationError(f"Unknown Grocy entity '{entity}'.")
+    return await client.get_object(entity, obj_id)
+
+
+def _build_query_filters(filters: dict[str, Any]) -> list[str]:
+    """Turn a ``{field: value}`` mapping into Grocy ``field=value`` query clauses.
+
+    Each entry becomes one ``query[]`` clause; Grocy ANDs them together. ``None``
+    values are rendered as empty strings (matching Grocy's handling of NULL via an
+    empty comparison), and booleans are normalized to ``1``/``0`` to match Grocy's
+    integer flag columns.
+    """
+    clauses: list[str] = []
+    for field, value in filters.items():
+        if isinstance(value, bool):
+            rendered = "1" if value else "0"
+        elif value is None:
+            rendered = ""
+        else:
+            rendered = str(value)
+        clauses.append(f"{field}={rendered}")
+    return clauses
+
+
+async def entity_query_data(
+    client: GrocyClient,
+    entity: str,
+    filters: dict[str, Any] | None = None,
+    fields: list[str] | None = None,
+) -> list[dict]:
+    """Query an entity with server-side equality filters, returning structured rows.
+
+    Maps each ``filters`` entry to a Grocy ``query[]=field=value`` clause (clauses
+    are ANDed together server-side), then returns the matching rows as full dicts so
+    callers can count/filter/aggregate programmatically — e.g. "products where
+    ``shopping_location_id=1``" or "products with no barcode".
+
+    Args:
+        entity: Entity type name (must be an exposed Grocy entity).
+        filters: Optional ``{field: value}`` equality filters. Booleans are
+            normalized to ``1``/``0``; ``None`` matches an empty/NULL value. Omit or
+            pass an empty dict to return all rows.
+        fields: Optional list of field names to project. When provided, each
+            returned row is narrowed to just these fields (missing fields are
+            omitted rather than padded). When omitted, full rows are returned.
+
+    Returns:
+        A list of row dicts (full objects, or projected to ``fields`` if given).
+    """
+    if entity not in EXPOSED_ENTITIES:
+        raise GrocyValidationError(f"Unknown Grocy entity '{entity}'.")
+
+    query = _build_query_filters(filters) if filters else None
+    rows = await client.get_objects(entity, query=query)
+
+    if fields:
+        rows = [{f: row[f] for f in fields if f in row} for row in rows]
+    return rows
+
+
 async def describe_entity_data(client: GrocyClient, entity: str) -> dict:
     if entity not in EXPOSED_ENTITIES:
         raise GrocyValidationError(f"Unknown Grocy entity '{entity}'.")

@@ -79,6 +79,7 @@ from grocy_mcp.core.stock import (
     stock_inventory,
     stock_open,
     stock_overview,
+    stock_product_full_data,
     stock_product_info,
     stock_search,
     stock_transfer,
@@ -95,10 +96,14 @@ from grocy_mcp.core.reference_data import (
     describe_entity_data,
     discover_entity_fields_data,
     entity_create_view,
+    entity_get_data,
+    entity_query_data,
     entity_update_view,
     list_entity_records,
     search_entity_candidates_data,
 )
+from grocy_mcp.core.barcode_lookup import barcode_lookup_external
+from grocy_mcp.core.pictures import stock_product_picture_upload
 from grocy_mcp.core.stock_journal import stock_journal
 from grocy_mcp.core.system import entity_list, entity_manage, system_info
 from grocy_mcp.core.tasks import task_complete, task_create, task_delete, task_undo, tasks_list
@@ -163,6 +168,32 @@ def create_mcp_server() -> FastMCP:
         """
         async with _get_client() as client:
             return await stock_product_info(client, product)
+
+    @mcp.tool()
+    async def stock_product_full_tool(product: str) -> dict:
+        """Get the complete picture for a single product in one call.
+
+        Returns a structured dict containing:
+        - ``product``: full product object (all fields from /objects/products)
+        - ``stock``: current totals (amount, value, opened, aggregated, prices, next due date)
+        - ``units``: resolved QU names for all four roles (stock / purchase / consume / price)
+        - ``location``: resolved default storage location (id + name)
+        - ``shopping_location``: resolved product-default shopping location, or null
+        - ``product_group``: resolved product group (id + name), or null
+        - ``parent_product``: resolved parent product (id + name), or null
+        - ``barcodes``: all barcodes for this product, each with resolved QU and
+          shopping-location names
+        - ``conversions``: all product-specific QU conversion factors (global conversions
+          with product_id=null are excluded — they apply to all products)
+
+        Stock journal / history entries are a separate concern and can be voluminous.
+        Use ``stock_journal_tool`` when you need transaction history for a product.
+
+        Args:
+            product: Product name (e.g. "Milk") or numeric product ID.
+        """
+        async with _get_client() as client:
+            return await stock_product_full_data(client, product)
 
     @mcp.tool()
     async def stock_add_tool(product: str, amount: float) -> str:
@@ -1026,7 +1057,16 @@ def create_mcp_server() -> FastMCP:
         resolve names implicitly.
 
         Args:
-            items: JSON array of confirmed apply items, each with product_id and amount.
+            items: JSON array of confirmed apply items. Each item requires
+                ``product_id`` (int) and ``amount`` (float > 0). Optional fields
+                passed through to the Grocy ``/stock/products/{productId}/add``
+                endpoint:
+
+                - ``price`` (float): price per stock quantity unit in configured currency
+                - ``best_before_date`` (str, ISO date YYYY-MM-DD): due/expiry date; defaults to today if omitted
+                - ``shopping_location_id`` (int): store where item was purchased
+                - ``purchased_date`` (str, ISO date YYYY-MM-DD): date of purchase
+                - ``note`` (str): free-text note for the stock entry
         """
         parsed_items = _parse_json_arg(items, "items")
         async with _get_client() as client:
@@ -1084,6 +1124,51 @@ def create_mcp_server() -> FastMCP:
             return await entity_list(client, entity)
 
     @mcp.tool()
+    async def entity_get_tool(entity: str, obj_id: int) -> dict:
+        """Fetch the FULL field set of one Grocy entity object by ID.
+
+        Unlike entity_list_tool (which shows only id + name) or describe_entity_tool
+        (which only samples field names), this returns every column of a single
+        object — including fields like min_stock_amount, default_consume_location_id,
+        description, picture_file_name, shopping_location_id, and timestamps.
+
+        Args:
+            entity: Entity type name (e.g. 'products', 'locations', 'chores').
+            obj_id: The object ID to fetch (use entity_list_tool to find IDs).
+        """
+        async with _get_client() as client:
+            return await entity_get_data(client, entity, obj_id)
+
+    @mcp.tool()
+    async def entity_query_tool(
+        entity: str, filters: str | None = None, fields: str | None = None
+    ) -> list[dict]:
+        """Query a Grocy entity with server-side filters, returning STRUCTURED rows.
+
+        Maps each filter to a Grocy 'query[]=field=value' clause (filters are ANDed
+        together server-side). Returns matching rows as JSON objects — not a
+        human-readable string — so you can count, filter, or aggregate them
+        programmatically. Examples: products where shopping_location_id=1, or
+        products with no parent_product_id (filter value null/empty).
+
+        Args:
+            entity: Entity type name (e.g. 'products', 'product_barcodes').
+            filters: Optional JSON object of {field: value} equality filters.
+                Booleans become 1/0; null matches an empty/NULL value. Example:
+                '{"shopping_location_id": 1}'. Omit to return all rows.
+            fields: Optional JSON array of field names to project each row down to.
+                Example: '["id", "name", "min_stock_amount"]'. Omit for full rows.
+        """
+        parsed_filters = _parse_json_arg(filters, "filters") if filters else None
+        parsed_fields = _parse_json_arg(fields, "fields") if fields else None
+        if parsed_filters is not None and not isinstance(parsed_filters, dict):
+            raise GrocyValidationError("filters must be a JSON object of field/value pairs.")
+        if parsed_fields is not None and not isinstance(parsed_fields, list):
+            raise GrocyValidationError("fields must be a JSON array of field names.")
+        async with _get_client() as client:
+            return await entity_query_data(client, entity, parsed_filters, parsed_fields)
+
+    @mcp.tool()
     async def entity_create_tool(entity: str, data: str) -> str:
         """Create a new object of any Grocy entity type.
 
@@ -1126,6 +1211,60 @@ def create_mcp_server() -> FastMCP:
         """
         async with _get_client() as client:
             return await entity_manage(client, entity, "delete", obj_id=obj_id)
+
+    # ------------------------------------------------------ Product pictures
+
+    @mcp.tool()
+    async def stock_product_picture_upload_tool(
+        product_id: int,
+        image_path: str,
+        filename: str | None = None,
+    ) -> dict:
+        """Upload a product picture from disk and link it to a Grocy product.
+
+        Reads the image file at *image_path*, uploads it to Grocy's
+        ``productpictures`` file group, then updates the product's
+        ``picture_file_name`` so it appears in the UI.
+
+        Args:
+            product_id: Numeric Grocy product ID.
+            image_path: Absolute or relative path to a PNG or JPG file on disk.
+            filename: Override the stored filename (default:
+                ``product-{id}-{epoch}.{ext}`` derived from the source file).
+
+        Returns:
+            dict with ``product_id``, ``picture_file_name``,
+            ``upload_status``, and ``link_status``.
+        """
+        async with _get_client() as client:
+            return await stock_product_picture_upload(client, product_id, image_path, filename)
+
+    # ------------------------------------------------------ External barcode lookup
+
+    @mcp.tool()
+    async def barcode_lookup_external_tool(
+        barcode: str,
+        source: str = "openfoodfacts",
+    ) -> dict:
+        """Look up a product by barcode in an external database.
+
+        Useful for pre-populating name, brand, and category before creating
+        a new product in Grocy. No data is written to Grocy — the caller
+        decides what to do with the result.
+
+        Supported sources:
+        - ``openfoodfacts`` (default) — free, no API key, best for grocery products.
+        - ``upcitemdb`` — trial tier (100 req/day), no API key, broader non-food coverage.
+
+        Args:
+            barcode: UPC / EAN / GTIN barcode string (e.g. ``"5000112637922"``).
+            source: ``"openfoodfacts"`` or ``"upcitemdb"`` (default: ``"openfoodfacts"``).
+
+        Returns:
+            ``{found, source, barcode, name, brand, quantity_text,
+            categories, image_url, nutriments, raw}``
+        """
+        return await barcode_lookup_external(barcode, source)
 
     return mcp
 
