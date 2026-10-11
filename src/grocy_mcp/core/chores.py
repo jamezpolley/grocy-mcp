@@ -70,8 +70,45 @@ async def chore_undo(client: GrocyClient, chore: str) -> str:
     return f"Undone most recent execution (ID {most_recent['id']}) of chore '{chore}'."
 
 
-async def chore_create(client: GrocyClient, name: str, **kwargs) -> str:
-    """Create a new chore."""
-    chore_data = {"name": name, **kwargs}
+async def chore_create(
+    client: GrocyClient,
+    name: str,
+    description: str | None = None,
+    period_type: str | None = None,
+    period_interval: int | None = None,
+    period_config: str | None = None,
+    track_date_only: bool = False,
+    rollover: bool = False,
+    assignment_type: str | None = None,
+    assignment_config: str | None = None,
+    consume_product_on_execution: bool = False,
+    product_id: int | None = None,
+    product_amount: float | None = None,
+    active: bool = True,
+    start_date: str | None = None,
+) -> str:
+    """Create a new chore with optional scheduling and assignment settings."""
+    chore_data: dict = {"name": name, "active": int(active)}
+    if description is not None:
+        chore_data["description"] = description
+    if period_type is not None:
+        chore_data["period_type"] = period_type
+    if period_interval is not None:
+        chore_data["period_interval"] = period_interval
+    if period_config is not None:
+        chore_data["period_config"] = period_config
+    chore_data["track_date_only"] = int(track_date_only)
+    chore_data["rollover"] = int(rollover)
+    if assignment_type is not None:
+        chore_data["assignment_type"] = assignment_type
+    if assignment_config is not None:
+        chore_data["assignment_config"] = assignment_config
+    chore_data["consume_product_on_execution"] = int(consume_product_on_execution)
+    if product_id is not None:
+        chore_data["product_id"] = product_id
+    if product_amount is not None:
+        chore_data["product_amount"] = product_amount
+    if start_date is not None:
+        chore_data["start_date"] = start_date
     chore_id = await client.create_object("chores", chore_data)
     return f"Chore '{name}' created (ID {chore_id})."

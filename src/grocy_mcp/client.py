@@ -149,6 +149,17 @@ class GrocyClient:
         resp = await self._request("POST", f"/stock/products/{product_id}/open", json=data)
         return resp.json()
 
+    async def get_product_entries(self, product_id: int) -> list[dict]:
+        resp = await self._request("GET", f"/stock/products/{product_id}/entries")
+        return resp.json()
+
+    async def get_stock_entry(self, entry_id: int) -> dict:
+        resp = await self._request("GET", f"/stock/entry/{entry_id}")
+        return resp.json()
+
+    async def edit_stock_entry(self, entry_id: int, data: dict) -> None:
+        await self._request("PUT", f"/stock/entry/{entry_id}", json=data)
+
     async def get_volatile_stock(self) -> dict:
         resp = await self._request("GET", "/stock/volatile")
         return resp.json()
@@ -332,8 +343,107 @@ class GrocyClient:
         resp = await self._request("GET", "/print/shoppinglist/thermal")
         return resp.json()
 
+    # --- Stock extended ---
+
+    async def get_product_price_history(self, product_id: int) -> list[dict]:
+        resp = await self._request("GET", f"/stock/products/{product_id}/price-history")
+        return resp.json()
+
+    async def merge_products(self, id_to_keep: int, id_to_remove: int) -> None:
+        await self._request("POST", f"/stock/products/{id_to_keep}/merge/{id_to_remove}")
+
+    async def get_product_locations(self, product_id: int) -> list[dict]:
+        resp = await self._request("GET", f"/stock/products/{product_id}/locations")
+        return resp.json()
+
+    async def get_location_entries(self, location_id: int) -> list[dict]:
+        resp = await self._request("GET", f"/stock/locations/{location_id}/entries")
+        return resp.json()
+
+    async def undo_booking(self, booking_id: int) -> None:
+        await self._request("POST", f"/stock/bookings/{booking_id}/undo")
+
+    async def add_expired_to_shopping_list(self, list_id: int = 1) -> None:
+        await self._request(
+            "POST", "/stock/shoppinglist/add-expired-products", json={"list_id": list_id}
+        )
+
+    async def add_overdue_to_shopping_list(self, list_id: int = 1) -> None:
+        await self._request(
+            "POST", "/stock/shoppinglist/add-overdue-products", json={"list_id": list_id}
+        )
+
+    # --- Recipes extended ---
+
+    async def copy_recipe(self, recipe_id: int) -> int:
+        resp = await self._request("POST", f"/recipes/{recipe_id}/copy")
+        return resp.json()["created_object_id"]
+
+    async def get_all_recipes_fulfillment(self) -> list[dict]:
+        resp = await self._request("GET", "/recipes/fulfillment")
+        return resp.json()
+
+    # --- Chores extended ---
+
+    async def merge_chores(self, id_to_keep: int, id_to_remove: int) -> None:
+        await self._request("POST", f"/chores/{id_to_keep}/merge/{id_to_remove}")
+
+    async def calculate_chore_next_assignments(self) -> None:
+        await self._request("POST", "/chores/executions/calculate-next-assignments")
+
+    # --- Userfields ---
+
+    async def get_userfields(self, entity: str, object_id: int) -> dict:
+        resp = await self._request("GET", f"/userfields/{entity}/{object_id}")
+        return resp.json()
+
+    async def set_userfields(self, entity: str, object_id: int, fields: dict) -> None:
+        await self._request("PUT", f"/userfields/{entity}/{object_id}", json=fields)
+
+    # --- Current user ---
+
+    async def get_current_user(self) -> dict:
+        resp = await self._request("GET", "/user")
+        return resp.json()
+
+    async def get_user_settings(self, key: str | None = None) -> Any:
+        if key is not None:
+            resp = await self._request("GET", f"/user/settings/{key}")
+        else:
+            resp = await self._request("GET", "/user/settings")
+        return resp.json()
+
+    async def set_user_setting(self, key: str, value: str) -> None:
+        await self._request("PUT", f"/user/settings/{key}", json={"value": value})
+
+    # --- Users ---
+
+    async def get_users(self) -> list[dict]:
+        resp = await self._request("GET", "/users")
+        return resp.json()
+
+    async def update_user(self, user_id: int, data: dict) -> None:
+        await self._request("PUT", f"/users/{user_id}", json=data)
+
     # --- System ---
 
     async def get_system_info(self) -> dict:
         resp = await self._request("GET", "/system/info")
         return resp.json()
+
+    async def get_api_spec(self) -> dict:
+        """Fetch the Grocy OpenAPI spec from GET /api (no trailing slash).
+
+        Tries several candidate paths in order and returns the first that succeeds.
+        GET /api/ (with trailing slash) returns 404 on Grocy 4.x; the empty path
+        resolves to the base URL without a trailing slash.
+        """
+        for path in ("", "/openapi/specification", "/openapi.json"):
+            try:
+                resp = await self._request("GET", path)
+                return resp.json()
+            except Exception:
+                continue
+        raise GrocyServerError(
+            "OpenAPI spec not available at any known path on this Grocy instance."
+        )

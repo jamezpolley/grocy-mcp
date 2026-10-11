@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 
 from grocy_mcp.client import GrocyClient
-from grocy_mcp.core.resolve import resolve_location, resolve_product
+from grocy_mcp.core.resolve import resolve_location, resolve_product, resolve_shopping_location
 
 
 async def stock_overview(client: GrocyClient) -> str:
@@ -417,20 +417,27 @@ async def stock_add(
     product: str,
     amount: float,
     location: str | None = None,
+    shopping_location: str | None = None,
     **kwargs,
 ) -> str:
-    """Add stock for a product, optionally into a specific storage location.
+    """Add stock for a product, optionally recording purchase details.
 
     If *location* is omitted, Grocy books the stock into the product's default
-    storage location.
+    storage location. *shopping_location* records the store where it was purchased,
+    creating a price-history entry when combined with *price*.
     """
     product_id = await resolve_product(client, product)
     if location is not None:
         kwargs["location_id"] = await resolve_location(client, location)
+    if shopping_location is not None:
+        kwargs["shopping_location_id"] = await resolve_shopping_location(client, shopping_location)
     await client.add_stock(product_id, amount, **kwargs)
+    parts = [f"Added {amount} of '{product}' to stock"]
     if location is not None:
-        return f"Added {amount} of '{product}' to stock in location '{location}'."
-    return f"Added {amount} of '{product}' to stock."
+        parts.append(f"in location '{location}'")
+    if shopping_location is not None:
+        parts.append(f"(purchased at '{shopping_location}')")
+    return " ".join(parts) + "."
 
 
 async def stock_consume(client: GrocyClient, product: str, amount: float, **kwargs) -> str:
@@ -495,6 +502,67 @@ async def stock_search(client: GrocyClient, query: str) -> str:
     for p in matches:
         lines.append(f"  [{p['id']}] {p.get('name', '?')}")
     return "\n".join(lines)
+
+
+async def stock_entry_edit(
+    client: GrocyClient,
+    entry_id: int,
+    best_before_date: str | None = None,
+    price: float | None = None,
+    purchased_date: str | None = None,
+    location: str | None = None,
+    shopping_location: str | None = None,
+    note: str | None = None,
+    amount: float | None = None,
+) -> str:
+    """Edit an existing stock entry's fields (best-before, price, date, location, note).
+
+    Grocy's PUT /stock/entry/{id} requires a full payload — partial updates are
+    rejected with "An amount is required". Also requires `open` to be set or it
+    500s with a PHP null→bool NPE. This function fetches the current entry first,
+    merges the requested changes, and sends the complete corrected payload.
+    """
+    current = await client.get_stock_entry(entry_id)
+
+    location_id: int | None = current.get("location_id")
+    if location is not None:
+        location_id = await resolve_location(client, location)
+
+    shopping_location_id: int | None = current.get("shopping_location_id")
+    if shopping_location is not None:
+        shopping_location_id = await resolve_shopping_location(client, shopping_location)
+
+    payload: dict = {
+        "amount": amount if amount is not None else current.get("amount", 0),
+        "best_before_date": best_before_date or current.get("best_before_date"),
+        "purchased_date": purchased_date or current.get("purchased_date"),
+        "price": price if price is not None else current.get("price"),
+        "open": bool(current.get("open", False)),
+        "location_id": location_id,
+        "shopping_location_id": shopping_location_id,
+        "note": note if note is not None else current.get("note"),
+    }
+
+    await client.edit_stock_entry(entry_id, payload)
+
+    changed = []
+    if best_before_date is not None:
+        changed.append(f"best_before={best_before_date}")
+    if price is not None:
+        changed.append(f"price={price}")
+    if purchased_date is not None:
+        changed.append(f"purchased_date={purchased_date}")
+    if location is not None:
+        changed.append(f"location='{location}'")
+    if shopping_location is not None:
+        changed.append(f"shopping_location='{shopping_location}'")
+    if note is not None:
+        changed.append(f"note set")
+    if amount is not None:
+        changed.append(f"amount={amount}")
+
+    summary = ", ".join(changed) if changed else "no fields changed"
+    return f"Stock entry {entry_id} updated: {summary}."
 
 
 async def stock_barcode_lookup(client: GrocyClient, barcode: str) -> str:

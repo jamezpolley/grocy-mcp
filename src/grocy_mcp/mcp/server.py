@@ -76,6 +76,7 @@ from grocy_mcp.core.stock import (
     stock_add,
     stock_barcode_lookup,
     stock_consume,
+    stock_entry_edit,
     stock_expiring,
     stock_inventory,
     stock_open,
@@ -198,19 +199,45 @@ def create_mcp_server() -> FastMCP:
 
     @mcp.tool()
     async def stock_add_tool(
-        product: str, amount: float, location: str | None = None
+        product: str,
+        amount: float,
+        location: str | None = None,
+        shopping_location: str | None = None,
+        price: float | None = None,
+        best_before_date: str | None = None,
+        purchased_date: str | None = None,
+        note: str | None = None,
     ) -> str:
         """Add stock for a product (e.g. after a purchase).
 
         Args:
             product: Product name (e.g. "Milk") or numeric product ID.
             amount: Quantity to add (e.g. 2.0 for two units).
-            location: Optional storage location name (e.g. "Freezer") or numeric
-                location ID to book the stock into. If omitted, Grocy uses the
-                product's default location. Use locations_list_tool to see options.
+            location: Optional storage location (e.g. "Freezer") where the stock
+                is stored. Defaults to the product's default location.
+            shopping_location: Optional store name (e.g. "Coles Woolloongabba") where
+                the purchase was made. Records a purchase entry for price history.
+            price: Optional price per unit paid. Combined with shopping_location to
+                build a price-over-time history in Grocy.
+            best_before_date: Optional best-before / expiry date in YYYY-MM-DD format.
+                Defaults to today if omitted.
+            purchased_date: Optional purchase date in YYYY-MM-DD format (e.g.
+                "2026-05-31"). Not in Grocy's official add spec — try passing it
+                here first; if the entry shows the wrong date afterwards, fall back
+                to stock_entry_edit_tool to correct it.
+            note: Optional note to attach to the stock entry.
         """
+        kwargs: dict = {}
+        if best_before_date is not None:
+            kwargs["best_before_date"] = best_before_date
+        if purchased_date is not None:
+            kwargs["purchased_date"] = purchased_date
+        if price is not None:
+            kwargs["price"] = price
+        if note is not None:
+            kwargs["note"] = note
         async with _get_client() as client:
-            return await stock_add(client, product, amount, location)
+            return await stock_add(client, product, amount, location, shopping_location, **kwargs)
 
     @mcp.tool()
     async def stock_consume_tool(product: str, amount: float) -> str:
@@ -265,6 +292,79 @@ def create_mcp_server() -> FastMCP:
         """
         async with _get_client() as client:
             return await stock_open(client, product, amount)
+
+    @mcp.tool()
+    async def stock_entry_edit_tool(
+        entry_id: int,
+        best_before_date: str | None = None,
+        price: float | None = None,
+        purchased_date: str | None = None,
+        location: str | None = None,
+        shopping_location: str | None = None,
+        note: str | None = None,
+        amount: float | None = None,
+    ) -> str:
+        """Edit fields on an existing stock entry (best-before, price, date, location, note).
+
+        Fetches the current entry first so Grocy's full-payload PUT requirement is
+        satisfied automatically — only the fields you pass are changed.
+
+        To find an entry_id: use stock_journal_tool or stock_product_info_tool to
+        see stock entries with their IDs.
+
+        Args:
+            entry_id: Numeric ID of the stock entry to edit.
+            best_before_date: New best-before / expiry date in YYYY-MM-DD format.
+            price: New price per stock unit.
+            purchased_date: Purchase date in YYYY-MM-DD format — use this to backdate
+                an entry (e.g. "2026-05-31"). Confirmed in Grocy's OpenAPI spec.
+            location: New storage location name or numeric ID.
+            shopping_location: Store where purchased (e.g. "Coles"). Updates
+                shopping_location_id on the entry.
+            note: New note text to attach to this stock entry.
+            amount: Corrected quantity for this specific entry (use stock_inventory_tool
+                to set the total for a product instead).
+        """
+        async with _get_client() as client:
+            return await stock_entry_edit(
+                client, entry_id, best_before_date, price, purchased_date,
+                location, shopping_location, note, amount
+            )
+
+    @mcp.tool()
+    async def stock_product_entries_tool(product: str) -> str:
+        """List all individual stock entries for a product, with their entry IDs.
+
+        Use this to find the entry_id required by stock_entry_edit_tool. Each entry
+        represents a discrete batch (e.g. two cans bought on different dates will be
+        two separate entries with different IDs, best-before dates, and prices).
+
+        Args:
+            product: Product name (e.g. "Milk") or numeric product ID.
+        """
+        from grocy_mcp.core.resolve import resolve_product
+        async with _get_client() as client:
+            product_id = await resolve_product(client, product)
+            entries = await client.get_product_entries(product_id)
+            if not entries:
+                return f"No stock entries found for '{product}'."
+            lines = [f"Stock entries for '{product}' (product ID {product_id}):"]
+            for e in entries:
+                eid = e.get("id")
+                amount = e.get("amount")
+                bbd = e.get("best_before_date", "—")
+                price = e.get("price")
+                loc = e.get("location_id")
+                note = e.get("note", "")
+                parts = [f"  [{eid}] amount={amount}  bbd={bbd}"]
+                if price is not None:
+                    parts[0] += f"  price={price}"
+                if loc is not None:
+                    parts[0] += f"  location_id={loc}"
+                if note:
+                    parts[0] += f"  note={note!r}"
+                lines.append(parts[0])
+            return "\n".join(lines)
 
     @mcp.tool()
     async def stock_search_tool(query: str) -> str:
@@ -336,6 +436,147 @@ def create_mcp_server() -> FastMCP:
         """
         async with _get_client() as client:
             return await stock_barcode_lookup(client, barcode)
+
+    @mcp.tool()
+    async def stock_price_history_tool(product: str) -> str:
+        """Return the purchase price history for a product.
+
+        Shows each recorded price entry with the price, shopping location, and date.
+        Useful for tracking price trends over time.
+
+        Args:
+            product: Product name (e.g. "Milk") or numeric product ID.
+        """
+        from grocy_mcp.core.resolve import resolve_product
+        async with _get_client() as client:
+            product_id = await resolve_product(client, product)
+            history = await client.get_product_price_history(product_id)
+            if not history:
+                return f"No price history found for '{product}'."
+            lines = [f"Price history for '{product}':"]
+            for entry in history:
+                price = entry.get("price", "?")
+                store = entry.get("shopping_location", {}) or {}
+                store_name = store.get("name") if isinstance(store, dict) else "?"
+                date = entry.get("date", "?")
+                lines.append(f"  {date}  price={price}  store={store_name or '—'}")
+            return "\n".join(lines)
+
+    @mcp.tool()
+    async def stock_product_merge_tool(product_to_keep: str, product_to_remove: str) -> str:
+        """Merge two products into one, keeping all stock and history under the first product.
+
+        The product_to_remove will be deleted; all its stock entries, barcodes, and
+        history are transferred to product_to_keep. This cannot be undone.
+
+        Args:
+            product_to_keep: Name or ID of the product to keep.
+            product_to_remove: Name or ID of the product to delete after merging.
+        """
+        from grocy_mcp.core.resolve import resolve_product
+        async with _get_client() as client:
+            keep_id = await resolve_product(client, product_to_keep)
+            remove_id = await resolve_product(client, product_to_remove)
+            await client.merge_products(keep_id, remove_id)
+            return (
+                f"Merged '{product_to_remove}' (ID {remove_id}) into "
+                f"'{product_to_keep}' (ID {keep_id}). The removed product no longer exists."
+            )
+
+    @mcp.tool()
+    async def stock_product_locations_tool(product: str) -> str:
+        """List all locations where a product currently has stock.
+
+        Useful before a transfer to confirm where stock is currently held.
+
+        Args:
+            product: Product name (e.g. "Milk") or numeric product ID.
+        """
+        from grocy_mcp.core.resolve import resolve_product
+        async with _get_client() as client:
+            product_id = await resolve_product(client, product)
+            locations = await client.get_product_locations(product_id)
+            if not locations:
+                return f"No stock locations found for '{product}'."
+            lines = [f"Stock locations for '{product}':"]
+            for loc in locations:
+                loc_id = loc.get("id") or loc.get("location_id")
+                name = loc.get("name", f"Location {loc_id}")
+                amount = loc.get("amount", "?")
+                is_freezer = loc.get("is_freezer")
+                suffix = " (freezer)" if is_freezer else ""
+                lines.append(f"  [{loc_id}] {name}{suffix} — amount: {amount}")
+            return "\n".join(lines)
+
+    @mcp.tool()
+    async def stock_location_entries_tool(location_id: int) -> str:
+        """List all stock entries at a specific location.
+
+        Shows every individual batch stored at the location with amount, product,
+        and best-before date.
+
+        Args:
+            location_id: Numeric location ID (from locations_list_tool).
+        """
+        async with _get_client() as client:
+            entries = await client.get_location_entries(location_id)
+            if not entries:
+                return f"No stock entries found at location ID {location_id}."
+            lines = [f"Stock entries at location {location_id}:"]
+            for e in entries:
+                eid = e.get("id")
+                product_id = e.get("product_id")
+                amount = e.get("amount")
+                bbd = e.get("best_before_date", "—")
+                note = e.get("note", "")
+                line = f"  [{eid}] product_id={product_id}  amount={amount}  bbd={bbd}"
+                if note:
+                    line += f"  note={note!r}"
+                lines.append(line)
+            return "\n".join(lines)
+
+    @mcp.tool()
+    async def stock_transaction_undo_tool(booking_id: int) -> str:
+        """Undo a specific stock booking/transaction by its booking ID.
+
+        Reverses a single stock change (purchase, consumption, transfer, etc.).
+        Use stock_journal_tool to find booking IDs — look for the 'id' field
+        in recent transactions.
+
+        Args:
+            booking_id: Numeric stock booking ID to undo.
+        """
+        async with _get_client() as client:
+            await client.undo_booking(booking_id)
+            return f"Stock booking {booking_id} has been undone."
+
+    @mcp.tool()
+    async def shopping_list_add_expired_tool(list_id: int = 1) -> str:
+        """Add all expired products to the shopping list for restocking.
+
+        Scans stock for expired items and adds them to the given shopping list.
+        Useful for identifying what needs replacing after a fridge/pantry clear-out.
+
+        Args:
+            list_id: Shopping list ID (default 1).
+        """
+        async with _get_client() as client:
+            await client.add_expired_to_shopping_list(list_id)
+            return f"Expired products added to shopping list {list_id}."
+
+    @mcp.tool()
+    async def shopping_list_add_overdue_tool(list_id: int = 1) -> str:
+        """Add all overdue products to the shopping list for restocking.
+
+        Scans stock for products past their best-before date and adds them to
+        the given shopping list.
+
+        Args:
+            list_id: Shopping list ID (default 1).
+        """
+        async with _get_client() as client:
+            await client.add_overdue_to_shopping_list(list_id)
+            return f"Overdue products added to shopping list {list_id}."
 
     # --------------------------------------------------------------- Shopping
 
@@ -595,6 +836,42 @@ def create_mcp_server() -> FastMCP:
         async with _get_client() as client:
             return await recipe_consume_preview(client, recipe)
 
+    @mcp.tool()
+    async def recipe_copy_tool(recipe_id: int) -> str:
+        """Clone an existing recipe, creating a duplicate with a new ID.
+
+        Useful for creating variations without modifying the original.
+        The copy will have the same name as the original (typically with
+        a "Copy of" prefix as set by Grocy).
+
+        Args:
+            recipe_id: Numeric recipe ID to copy (from recipes_list_tool).
+        """
+        async with _get_client() as client:
+            new_id = await client.copy_recipe(recipe_id)
+            return f"Recipe {recipe_id} copied successfully. New recipe ID: {new_id}."
+
+    @mcp.tool()
+    async def recipe_fulfillment_all_tool() -> str:
+        """Check stock fulfillment status for ALL recipes at once.
+
+        Returns a summary showing which recipes can be made with current stock
+        and which are missing ingredients. Useful for meal planning.
+        """
+        async with _get_client() as client:
+            results = await client.get_all_recipes_fulfillment()
+            if not results:
+                return "No recipes found."
+            lines = ["Recipe fulfillment status:"]
+            for r in results:
+                recipe_id = r.get("recipe_id")
+                name = r.get("recipe", {}).get("name") if isinstance(r.get("recipe"), dict) else f"Recipe {recipe_id}"
+                fulfilled = r.get("need_fulfilled")
+                missing = r.get("missing_products_count", 0)
+                status = "✓ ready" if fulfilled else f"✗ missing {missing} ingredient(s)"
+                lines.append(f"  [{recipe_id}] {name} — {status}")
+            return "\n".join(lines)
+
     # ----------------------------------------------------------------- Chores
 
     @mcp.tool()
@@ -641,14 +918,87 @@ def create_mcp_server() -> FastMCP:
             return await chore_undo(client, chore)
 
     @mcp.tool()
-    async def chore_create_tool(name: str) -> str:
-        """Create a new chore in Grocy.
+    async def chore_create_tool(
+        name: str,
+        description: str | None = None,
+        period_type: str | None = None,
+        period_interval: int | None = None,
+        period_config: str | None = None,
+        track_date_only: bool = False,
+        rollover: bool = False,
+        assignment_type: str | None = None,
+        assignment_config: str | None = None,
+        consume_product_on_execution: bool = False,
+        product_id: int | None = None,
+        product_amount: float | None = None,
+        active: bool = True,
+        start_date: str | None = None,
+    ) -> str:
+        """Create a new chore in Grocy with optional scheduling and assignment settings.
 
         Args:
             name: Name for the chore (e.g. "Clean bathroom").
+            description: Optional description.
+            period_type: How often the chore repeats. One of: "manually", "daily",
+                "weekly" (period_config = comma-separated ISO weekday numbers 1-7),
+                "monthly", "yearly", "hourly", "half-hourly", "quarter-hourly",
+                "two-hourly", "every-72-hours". Omit for manual-only chores.
+            period_interval: How many period units between executions (default 1).
+                E.g. period_type="weekly", period_interval=2 = every 2 weeks.
+            period_config: Extra config for the period type. For "weekly": comma-separated
+                day numbers (1=Mon … 7=Sun, e.g. "1,3,5" for Mon/Wed/Fri).
+            track_date_only: If true, track only the date (not time) of execution.
+            rollover: If true, skip overdue executions and roll to the next scheduled time.
+            assignment_type: How to assign the chore. One of: "no-assignment",
+                "random", "in-order-starting-with-first-user",
+                "in-order-starting-with-last-user".
+            assignment_config: JSON array of Grocy user IDs for rotation/assignment,
+                e.g. "[1, 2, 3]". Required when assignment_type is not "no-assignment".
+            consume_product_on_execution: If true, consume product_id/product_amount stock.
+            product_id: Product ID to consume on execution (requires consume_product_on_execution).
+            product_amount: Amount of product to consume on execution.
+            active: Whether the chore is active (default true).
+            start_date: ISO date string (YYYY-MM-DD) for when the chore starts.
         """
         async with _get_client() as client:
-            return await chore_create(client, name)
+            return await chore_create(
+                client, name, description, period_type, period_interval, period_config,
+                track_date_only, rollover, assignment_type, assignment_config,
+                consume_product_on_execution, product_id, product_amount, active, start_date,
+            )
+
+    @mcp.tool()
+    async def chore_merge_tool(chore_to_keep: str, chore_to_remove: str) -> str:
+        """Merge two chores into one, keeping all execution history under the first chore.
+
+        The chore_to_remove will be deleted; all its execution log entries are
+        transferred to chore_to_keep. This cannot be undone.
+
+        Args:
+            chore_to_keep: Name or ID of the chore to keep.
+            chore_to_remove: Name or ID of the chore to delete after merging.
+        """
+        from grocy_mcp.core.resolve import resolve_chore
+        async with _get_client() as client:
+            keep_id = await resolve_chore(client, chore_to_keep)
+            remove_id = await resolve_chore(client, chore_to_remove)
+            await client.merge_chores(keep_id, remove_id)
+            return (
+                f"Merged '{chore_to_remove}' (ID {remove_id}) into "
+                f"'{chore_to_keep}' (ID {keep_id}). The removed chore no longer exists."
+            )
+
+    @mcp.tool()
+    async def chore_next_assignments_tool() -> str:
+        """Recalculate next assigned user for all chores with user rotation.
+
+        Grocy tracks whose turn it is for chores with rotation-based assignment.
+        Call this after changing chore assignments or execution history to
+        ensure the next-user field is up to date.
+        """
+        async with _get_client() as client:
+            await client.calculate_chore_next_assignments()
+            return "Next user assignments recalculated for all chores."
 
     # -------------------------------------------------------------- Locations
 
@@ -1154,6 +1504,183 @@ def create_mcp_server() -> FastMCP:
         async with _get_client() as client:
             return await workflow_shopping_reconcile_apply_data(client, parsed_actions)
 
+    # --------------------------------------------------------------- Userfields
+
+    @mcp.tool()
+    async def userfields_list_tool(entity: str) -> str:
+        """List all custom userfield definitions for a Grocy entity.
+
+        Userfields are custom fields you can add to any entity in Grocy.
+        This lists the field definitions (name, type, caption) for all userfields
+        on the given entity type.
+
+        Args:
+            entity: Entity name to list userfields for (e.g. "products", "chores",
+                "batteries", "locations", "recipes", "tasks").
+        """
+        async with _get_client() as client:
+            # Userfield definitions live in /objects/userfields filtered by entity
+            fields = await client.get_objects("userfields", query=f"entity={entity}")
+            if not fields:
+                return f"No custom userfields defined for entity '{entity}'."
+            lines = [f"Userfields for '{entity}':"]
+            for f in fields:
+                fid = f.get("id")
+                name = f.get("name", "?")
+                caption = f.get("caption", "")
+                ftype = f.get("type", "?")
+                lines.append(f"  [{fid}] {name} ({ftype})" + (f" — {caption}" if caption else ""))
+            return "\n".join(lines)
+
+    @mcp.tool()
+    async def userfields_get_tool(entity: str, object_id: int) -> dict:
+        """Get the custom userfield values for a specific object.
+
+        Returns a dict of field-name → value for all userfields on the object.
+
+        Args:
+            entity: Entity name (e.g. "products", "chores", "batteries").
+            object_id: Numeric ID of the object to read userfields from.
+        """
+        async with _get_client() as client:
+            return await client.get_userfields(entity, object_id)
+
+    @mcp.tool()
+    async def userfields_set_tool(entity: str, object_id: int, fields: str) -> str:
+        """Set custom userfield values on a specific object.
+
+        Args:
+            entity: Entity name (e.g. "products", "chores", "batteries").
+            object_id: Numeric ID of the object to update.
+            fields: JSON object of field-name → value pairs to set.
+                Example: '{"who_uses": "james", "priority": "high"}'.
+        """
+        parsed_fields = _parse_json_arg(fields, "fields")
+        async with _get_client() as client:
+            await client.set_userfields(entity, object_id, parsed_fields)
+            return f"Userfields updated for {entity} ID {object_id}."
+
+    # -------------------------------------------------------- User profile & settings
+
+    @mcp.tool()
+    async def user_profile_tool() -> str:
+        """Return the currently authenticated Grocy user's profile.
+
+        Shows id, username, display name, first name, and last name.
+        """
+        async with _get_client() as client:
+            user = await client.get_current_user()
+            uid = user.get("id")
+            username = user.get("username", "?")
+            display = user.get("display_name") or ""
+            first = user.get("first_name", "")
+            last = user.get("last_name", "")
+            full_name = f"{first} {last}".strip()
+            parts = [f"Current user: [{uid}] {username}"]
+            if full_name:
+                parts.append(f"  Name: {full_name}")
+            if display:
+                parts.append(f"  Display name: {display}")
+            return "\n".join(parts)
+
+    @mcp.tool()
+    async def user_settings_tool(key: str | None = None) -> str:
+        """Read the current user's settings from Grocy.
+
+        Returns all settings as key=value pairs, or a single setting if key is given.
+
+        Args:
+            key: Optional setting key to read (e.g. "night_mode_enabled"). If omitted,
+                all settings are returned.
+        """
+        async with _get_client() as client:
+            data = await client.get_user_settings(key)
+            if key is not None:
+                # Single setting returns {"value": ...}
+                value = data.get("value") if isinstance(data, dict) else data
+                return f"{key} = {value!r}"
+            # All settings: dict of key → value
+            if not data:
+                return "No user settings found."
+            lines = ["User settings:"]
+            for k, v in sorted(data.items()):
+                lines.append(f"  {k} = {v!r}")
+            return "\n".join(lines)
+
+    @mcp.tool()
+    async def user_setting_set_tool(key: str, value: str) -> str:
+        """Set a user setting key to a string value.
+
+        Args:
+            key: The setting key to set (e.g. "night_mode_enabled").
+            value: The value to set (always a string; Grocy converts as needed).
+        """
+        async with _get_client() as client:
+            await client.set_user_setting(key, value)
+            return f"User setting '{key}' set to {value!r}."
+
+    # ------------------------------------------------------------------ Users
+
+    @mcp.tool()
+    async def users_list_tool() -> str:
+        """List all Grocy users with their IDs, usernames, and display names.
+
+        Useful for looking up user IDs needed for chore assignment (assignment_config)
+        or for identifying a user before updating their account.
+        """
+        async with _get_client() as client:
+            users = await client.get_users()
+            if not users:
+                return "No users found."
+            lines = ["Users:"]
+            for u in users:
+                uid = u.get("id")
+                username = u.get("username", "?")
+                display = u.get("display_name") or f"{u.get('first_name', '')} {u.get('last_name', '')}".strip()
+                lines.append(f"  [{uid}] {username}" + (f" ({display})" if display else ""))
+            return "\n".join(lines)
+
+    @mcp.tool()
+    async def user_update_tool(
+        user_id: int,
+        username: str | None = None,
+        first_name: str | None = None,
+        last_name: str | None = None,
+        password: str | None = None,
+    ) -> str:
+        """Edit a Grocy user account — change display name, username, or reset password.
+
+        Fetches the current user first so unspecified fields are preserved.
+
+        Args:
+            user_id: Numeric user ID (from users_list_tool).
+            username: New username (login name).
+            first_name: New first name.
+            last_name: New last name.
+            password: New password — use this to reset a user's password.
+        """
+        async with _get_client() as client:
+            users = await client.get_users()
+            current = next((u for u in users if u.get("id") == user_id), None)
+            if current is None:
+                return f"User ID {user_id} not found."
+            payload: dict = {
+                "username": username if username is not None else current.get("username", ""),
+                "first_name": first_name if first_name is not None else current.get("first_name", ""),
+                "last_name": last_name if last_name is not None else current.get("last_name", ""),
+            }
+            if password is not None:
+                payload["password"] = password
+            await client.update_user(user_id, payload)
+            changed = []
+            if username is not None:
+                changed.append(f"username → {username}")
+            if first_name is not None or last_name is not None:
+                changed.append("name updated")
+            if password is not None:
+                changed.append("password reset")
+            return f"User {user_id} ({current.get('username')}) updated: {', '.join(changed) or 'no changes'}."
+
     # ----------------------------------------------------------------- System
 
     @mcp.tool()
@@ -1164,6 +1691,34 @@ def create_mcp_server() -> FastMCP:
         """
         async with _get_client() as client:
             return await system_info(client)
+
+    @mcp.tool()
+    async def system_api_docs_tool(endpoint_filter: str | None = None) -> str:
+        """Retrieve the Grocy OpenAPI spec from this instance's /api/ endpoint.
+
+        Returns the full OpenAPI JSON spec, optionally filtered to paths matching
+        a substring. Use this to verify exact field names and types before
+        implementing or modifying tools.
+
+        Args:
+            endpoint_filter: Optional substring to filter paths by (e.g. "add",
+                "/stock/", "purchase"). If omitted, returns all paths.
+        """
+        import json
+
+        async with _get_client() as client:
+            spec = await client.get_api_spec()
+
+        if endpoint_filter:
+            paths = spec.get("paths", {})
+            filtered = {
+                path: methods
+                for path, methods in paths.items()
+                if endpoint_filter.lower() in path.lower()
+            }
+            return json.dumps({"paths": filtered}, indent=2)
+
+        return json.dumps(spec, indent=2)
 
     @mcp.tool()
     async def entity_list_tool(entity: str) -> str:
